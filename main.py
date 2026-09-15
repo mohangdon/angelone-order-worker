@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 
-from angel_client import TERMINAL, angel_client
+from angel_client import TERMINAL, ContractResolutionError, angel_client
 from config import settings
 from models import CommandRequest, ExitTradeRequest, ModifyOrderRequest, PlaceOrderRequest, ProtectionRequest
 from store import JsonStore
@@ -56,6 +56,11 @@ async def place_market_with_retries(request, max_retries=3):
             if result["status"] != "REJECTED":
                 return {**result, "attempts": attempts, "retry_count": attempt_no - 1,
                         "max_retries": max_retries}
+        except ContractResolutionError as exc:
+            attempts.append({"attempt": attempt_no, "status": "CONTRACT_NOT_FOUND", "error": str(exc)})
+            return {"ok": False, "order_id": "", "status": "CONTRACT_NOT_FOUND", "order": {},
+                    "request": {}, "response": {}, "attempts": attempts, "retry_count": 0,
+                    "max_retries": max_retries, "retryable": False, "error": str(exc)}
         except Exception as exc:
             attempts.append({"attempt": attempt_no, "status": "REJECTED", "error": str(exc)})
         if attempt_no <= max_retries:

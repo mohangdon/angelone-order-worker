@@ -12,6 +12,10 @@ INSTRUMENT_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAP
 TERMINAL = {"COMPLETE", "TRADED", "FILLED", "REJECTED", "CANCELLED", "CANCELED"}
 
 
+class ContractResolutionError(ValueError):
+    pass
+
+
 class AngelClient:
     def __init__(self):
         self.api = None
@@ -57,7 +61,7 @@ class AngelClient:
     @staticmethod
     def normalized_expiry(value):
         raw = str(value or "").strip().upper()
-        for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d%b%Y", "%d-%b-%y"):
+        for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d%b%Y", "%d-%b-%y", "%d%b%y"):
             try:
                 return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
             except ValueError:
@@ -85,7 +89,7 @@ class AngelClient:
                 continue
             candidates.append(row)
         if len(candidates) != 1:
-            raise ValueError(f"Expected one Angel contract, found {len(candidates)} for {contract.model_dump()}")
+            raise ContractResolutionError(f"Expected one Angel contract, found {len(candidates)} for {contract.model_dump()}")
         row = candidates[0]
         return {"exchange": contract.exchange, "tradingsymbol": row["symbol"],
                 "symboltoken": str(row["token"]), "lotsize": int(float(row.get("lotsize") or 0))}

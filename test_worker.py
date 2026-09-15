@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 import main
+from angel_client import AngelClient, ContractResolutionError
 
 
 class WorkerApiTests(unittest.TestCase):
@@ -21,6 +22,10 @@ class WorkerApiTests(unittest.TestCase):
 
     def test_requires_worker_token(self):
         self.assertEqual(self.client.get("/v1/audit").status_code, 401)
+
+    def test_flattrade_and_angel_expiry_formats_normalize_identically(self):
+        self.assertEqual(AngelClient.normalized_expiry("15SEP26"), "2026-09-15")
+        self.assertEqual(AngelClient.normalized_expiry("15SEP2026"), "2026-09-15")
 
     def test_repeated_command_does_not_place_twice(self):
         placed = AsyncMock(return_value=("ORDER1", {"quantity": "65"}, {"status": True, "data": {"orderid": "ORDER1"}}))
@@ -50,6 +55,17 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(response.json()["retry_count"], 3)
         self.assertEqual(len(response.json()["attempts"]), 4)
         self.assertEqual(placed.await_count, 4)
+
+    def test_contract_resolution_failure_is_not_retried(self):
+        placed = AsyncMock(side_effect=ContractResolutionError("contract not found"))
+        with patch.object(main.angel_client, "place", placed), patch.object(main.state_store, "save"), \
+             patch.object(main.audit_store, "save"):
+            response = self.client.post("/v1/orders", headers=self.headers,
+                                        json={**self.payload, "command_id": "missing-contract-1"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "CONTRACT_NOT_FOUND")
+        self.assertEqual(response.json()["retry_count"], 0)
+        self.assertEqual(placed.await_count, 1)
 
     def test_protection_uses_stoploss_limit_and_limit_target(self):
         placed = AsyncMock(side_effect=[
