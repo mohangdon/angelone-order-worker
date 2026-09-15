@@ -111,6 +111,13 @@ async def get_order(order_id: str):
     return {"ok": True, "order_id": order_id, "order": order_data(response), "response": response}
 
 
+@app.get("/v1/orders", dependencies=[Depends(authorize)])
+async def get_orders():
+    response = await angel_client.call("orderBook") or {}
+    rows = response.get("data") if isinstance(response, dict) else []
+    return {"ok": True, "orders": rows if isinstance(rows, list) else [], "response": response}
+
+
 @app.get("/v1/trades/{copy_trade_id}", dependencies=[Depends(authorize)])
 async def get_trade(copy_trade_id: str):
     try:
@@ -126,7 +133,17 @@ async def cancel_order(order_id: str, request: CommandRequest):
         return state["commands"][request.command_id]
     known = state["orders"].get(order_id) or {}
     response = await angel_client.call("cancelOrder", order_id, known.get("variety") or "NORMAL")
-    result = {"ok": bool((response or {}).get("status")), "order_id": order_id, "response": response}
+    verify_response, verify, status = {}, {}, "PENDING"
+    for _ in range(8):
+        verify_response = await angel_client.order(order_id)
+        verify = order_data(verify_response)
+        status = str(verify.get("orderstatus") or verify.get("status") or "PENDING").upper()
+        if status in TERMINAL:
+            break
+        await asyncio.sleep(0.25)
+    result = {"ok": status in {"CANCELLED", "CANCELED"}, "order_id": order_id,
+              "status": status, "order": verify, "response": response,
+              "status_response": verify_response}
     state["commands"][request.command_id] = result
     state_store.save(state)
     record("CANCEL_ORDER", request.command_id, result, "success" if result["ok"] else "failed")
@@ -172,7 +189,7 @@ async def set_protection(copy_trade_id: str, request: ProtectionRequest):
     placed = {}
     base = {"copy_trade_id": copy_trade_id, "contract": request.contract,
             "transaction_type": request.transaction_type, "quantity": request.quantity,
-            "product_type": "INTRADAY"}
+            "product_type": "CARRYFORWARD"}
     if request.sl_price > 0:
         sl_limit = round((request.sl_price * (0.95 if request.transaction_type == "SELL" else 1.05)) / 0.05) * 0.05
         sl_request = PlaceOrderRequest(command_id=request.command_id + "-sl", **base,
@@ -225,7 +242,7 @@ async def exit_trade(copy_trade_id: str, request: ExitTradeRequest):
             return result
     place_request = PlaceOrderRequest(command_id=request.command_id + "-market", copy_trade_id=copy_trade_id,
         contract=request.contract, transaction_type=request.transaction_type, quantity=request.quantity,
-        order_type="MARKET", product_type="INTRADAY", tag="copyexit")
+        order_type="MARKET", product_type="CARRYFORWARD", tag="copyexit")
     result = await place_market_with_retries(place_request)
     order_id = result.get("order_id", "")
     trade.update({"exit_order_id": order_id, "sl_order_id": "", "target_order_id": ""})

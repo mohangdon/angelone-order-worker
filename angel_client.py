@@ -110,7 +110,20 @@ class AngelClient:
         return order_id, payload, response
 
     async def order(self, order_id):
-        return await self.call("individual_order_details", str(order_id)) or {}
+        order_id = str(order_id)
+        try:
+            response = await self.call("individual_order_details", order_id)
+            data = (response or {}).get("data") if isinstance(response, dict) else None
+            if isinstance(data, dict) and (data.get("orderstatus") or data.get("status")):
+                return response
+        except Exception:
+            pass
+        response = await self.call("orderBook") or {}
+        rows = response.get("data") if isinstance(response, dict) else []
+        for row in rows if isinstance(rows, list) else []:
+            if order_id in {str(row.get("orderid") or ""), str(row.get("uniqueorderid") or "")}:
+                return {"status": True, "message": "SUCCESS", "data": row}
+        return response
 
 
 angel_client = AngelClient()

@@ -17,7 +17,7 @@ class PlaceOrderRequest(BaseModel):
     transaction_type: Literal["BUY", "SELL"]
     quantity: int = Field(gt=0)
     order_type: Literal["MARKET", "LIMIT", "STOPLOSS_LIMIT", "STOPLOSS_MARKET"] = "MARKET"
-    product_type: Literal["INTRADAY", "CARRYFORWARD"] = "INTRADAY"
+    product_type: Literal["INTRADAY", "CARRYFORWARD"] = "CARRYFORWARD"
     price: float = 0
     trigger_price: float = 0
     tag: str = "copytrade"
