@@ -126,13 +126,6 @@ class AngelClient:
 
     async def order(self, order_id):
         order_id = str(order_id)
-        response = await self.call("orderBook") or {}
-        rows = response.get("data") if isinstance(response, dict) else []
-        for row in rows if isinstance(rows, list) else []:
-            if order_id in {str(row.get("orderid") or ""), str(row.get("uniqueorderid") or "")}:
-                logger.info("Order status order_id=%s source=orderbook status=%s",
-                            order_id, row.get("orderstatus") or row.get("status"))
-                return {"status": True, "message": "SUCCESS", "data": row}
         unique_order_id = self.unique_order_ids.get(order_id)
         if unique_order_id:
             try:
@@ -142,8 +135,15 @@ class AngelClient:
                     logger.info("Order status order_id=%s source=individual status=%s",
                                 order_id, data.get("orderstatus") or data.get("status"))
                     return response
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Individual status unavailable order_id=%s error=%s", order_id, exc)
+        response = await self.call("orderBook") or {}
+        rows = response.get("data") if isinstance(response, dict) else []
+        for row in rows if isinstance(rows, list) else []:
+            if order_id in {str(row.get("orderid") or ""), str(row.get("uniqueorderid") or "")}:
+                logger.info("Order status order_id=%s source=orderbook status=%s",
+                            order_id, row.get("orderstatus") or row.get("status"))
+                return {"status": True, "message": "SUCCESS", "data": row}
         logger.warning("Order status not found order_id=%s", order_id)
         return {}
 

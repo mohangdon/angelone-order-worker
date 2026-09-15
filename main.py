@@ -59,7 +59,7 @@ async def place_market_with_retries(request, max_retries=3):
                 result.update({"status": status, "order": info})
                 if status in TERMINAL:
                     break
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(1)
             attempts.append({"attempt": attempt_no, "order_id": order_id, "status": result["status"],
                              "request": payload, "response": response, "order": result["order"]})
             if result["status"] != "REJECTED":
@@ -152,8 +152,13 @@ async def place_order(request: PlaceOrderRequest):
 
 @app.get("/v1/orders/{order_id}", dependencies=[Depends(authorize)])
 async def get_order(order_id: str):
-    response = await angel_client.order(order_id)
-    return {"ok": True, "order_id": order_id, "order": order_data(response), "response": response}
+    try:
+        response = await angel_client.order(order_id)
+        return {"ok": True, "order_id": order_id, "order": order_data(response), "response": response}
+    except Exception as exc:
+        logger.warning("Order status temporarily unavailable order_id=%s error=%s", order_id, exc)
+        return {"ok": True, "order_id": order_id, "order": {}, "response": {},
+                "status": "PENDING", "status_error": str(exc)}
 
 
 @app.get("/v1/orders", dependencies=[Depends(authorize)])
@@ -177,6 +182,19 @@ async def cancel_order(order_id: str, request: CommandRequest):
     if request.command_id in state["commands"]:
         return state["commands"][request.command_id]
     known = state["orders"].get(order_id) or {}
+    try:
+        before_response = await angel_client.order(order_id)
+        before = order_data(before_response)
+        before_status = str(before.get("orderstatus") or before.get("status") or "PENDING").upper()
+        if before_status in {"COMPLETE", "TRADED", "FILLED"}:
+            result = {"ok": False, "order_id": order_id, "status": before_status,
+                      "order": before, "response": {}, "already_filled": True}
+            state["commands"][request.command_id] = result
+            state_store.save(state)
+            record("CANCEL_ORDER", request.command_id, result, "failed")
+            return result
+    except Exception as exc:
+        logger.warning("Pre-cancel status unavailable order_id=%s error=%s", order_id, exc)
     response = await angel_client.call("cancelOrder", order_id, known.get("variety") or "NORMAL")
     verify_response, verify, status = {}, {}, "PENDING"
     for _ in range(8):
