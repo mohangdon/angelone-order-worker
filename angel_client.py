@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime
 
 import httpx
@@ -10,6 +11,8 @@ from config import settings
 
 INSTRUMENT_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
 TERMINAL = {"COMPLETE", "TRADED", "FILLED", "REJECTED", "CANCELLED", "CANCELED"}
+logger = logging.getLogger("angel_worker.client")
+logger.setLevel(logging.INFO)
 
 
 class ContractResolutionError(ValueError):
@@ -22,6 +25,7 @@ class AngelClient:
         self.login_lock = asyncio.Lock()
         self.instruments = []
         self.instrument_date = ""
+        self.unique_order_ids = {}
 
     async def login(self):
         async with self.login_lock:
@@ -35,6 +39,7 @@ class AngelClient:
             if not isinstance(response, dict) or not response.get("status"):
                 raise RuntimeError(f"Angel login failed: {response}")
             self.api = api
+            logger.info("Angel login successful client=%s", settings.ANGEL_CLIENT_CODE[-4:])
 
     async def call(self, method, *args):
         await self.login()
@@ -57,6 +62,7 @@ class AngelClient:
             rows = response.json()
         self.instruments = rows if isinstance(rows, list) else []
         self.instrument_date = today
+        logger.info("Instrument master loaded rows=%d date=%s", len(self.instruments), today)
 
     @staticmethod
     def normalized_expiry(value):
@@ -91,8 +97,11 @@ class AngelClient:
         if len(candidates) != 1:
             raise ContractResolutionError(f"Expected one Angel contract, found {len(candidates)} for {contract.model_dump()}")
         row = candidates[0]
-        return {"exchange": contract.exchange, "tradingsymbol": row["symbol"],
-                "symboltoken": str(row["token"]), "lotsize": int(float(row.get("lotsize") or 0))}
+        resolved = {"exchange": contract.exchange, "tradingsymbol": row["symbol"],
+                    "symboltoken": str(row["token"]), "lotsize": int(float(row.get("lotsize") or 0))}
+        logger.info("Contract resolved input=%s symbol=%s token=%s lot_size=%s",
+                    contract.model_dump(), resolved["tradingsymbol"], resolved["symboltoken"], resolved["lotsize"])
+        return resolved
 
     async def place(self, request):
         symbol = await self.resolve(request.contract)
@@ -103,27 +112,40 @@ class AngelClient:
             "triggerprice": str(request.trigger_price or 0), "squareoff": "0", "stoploss": "0",
             "quantity": str(request.quantity), "ordertag": request.tag[:15],
         }
+        logger.info("Place order request command=%s copy_trade=%s payload=%s",
+                    request.command_id, request.copy_trade_id, payload)
         response = await self.call("placeOrderFullResponse", payload)
+        logger.info("Place order response command=%s response=%s", request.command_id, response)
         order_id = str(((response or {}).get("data") or {}).get("orderid") or "")
         if not order_id:
             raise RuntimeError(f"Angel order rejected: {response}")
+        unique_order_id = str(((response or {}).get("data") or {}).get("uniqueorderid") or "")
+        if unique_order_id:
+            self.unique_order_ids[order_id] = unique_order_id
         return order_id, payload, response
 
     async def order(self, order_id):
         order_id = str(order_id)
-        try:
-            response = await self.call("individual_order_details", order_id)
-            data = (response or {}).get("data") if isinstance(response, dict) else None
-            if isinstance(data, dict) and (data.get("orderstatus") or data.get("status")):
-                return response
-        except Exception:
-            pass
         response = await self.call("orderBook") or {}
         rows = response.get("data") if isinstance(response, dict) else []
         for row in rows if isinstance(rows, list) else []:
             if order_id in {str(row.get("orderid") or ""), str(row.get("uniqueorderid") or "")}:
+                logger.info("Order status order_id=%s source=orderbook status=%s",
+                            order_id, row.get("orderstatus") or row.get("status"))
                 return {"status": True, "message": "SUCCESS", "data": row}
-        return response
+        unique_order_id = self.unique_order_ids.get(order_id)
+        if unique_order_id:
+            try:
+                response = await self.call("individual_order_details", unique_order_id)
+                data = (response or {}).get("data") if isinstance(response, dict) else None
+                if isinstance(data, dict) and (data.get("orderstatus") or data.get("status")):
+                    logger.info("Order status order_id=%s source=individual status=%s",
+                                order_id, data.get("orderstatus") or data.get("status"))
+                    return response
+            except Exception:
+                pass
+        logger.warning("Order status not found order_id=%s", order_id)
+        return {}
 
 
 angel_client = AngelClient()

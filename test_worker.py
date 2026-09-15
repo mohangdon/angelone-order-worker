@@ -56,6 +56,20 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(len(response.json()["attempts"]), 4)
         self.assertEqual(placed.await_count, 4)
 
+    def test_status_failure_after_order_id_never_places_replacement(self):
+        placed = AsyncMock(return_value=("ORDER1", {"quantity": "65"},
+                                         {"status": True, "data": {"orderid": "ORDER1"}}))
+        order = AsyncMock(side_effect=RuntimeError("temporary order book failure"))
+        with patch.object(main.angel_client, "place", placed), patch.object(main.angel_client, "order", order), \
+             patch.object(main.state_store, "save"), patch.object(main.audit_store, "save"):
+            response = self.client.post("/v1/orders", headers=self.headers,
+                                        json={**self.payload, "command_id": "status-failure-1"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        self.assertEqual(response.json()["status"], "PENDING")
+        self.assertEqual(response.json()["order_id"], "ORDER1")
+        self.assertEqual(placed.await_count, 1)
+
     def test_contract_resolution_failure_is_not_retried(self):
         placed = AsyncMock(side_effect=ContractResolutionError("contract not found"))
         with patch.object(main.angel_client, "place", placed), patch.object(main.state_store, "save"), \

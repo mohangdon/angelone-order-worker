@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import secrets
 from datetime import datetime, timezone
 
@@ -11,9 +12,13 @@ from store import JsonStore
 
 
 app = FastAPI(title="Angel One Copy Trading Worker", version="1.0.0")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("angel_worker")
+logger.setLevel(logging.INFO)
 state_store, audit_store = JsonStore("worker_state.json"), JsonStore("worker_audit.json")
 state = state_store.load({"commands": {}, "orders": {}, "trades": {}})
 audit = audit_store.load([])
+command_locks = {}
 
 
 def authorize(authorization: str = Header(default="")):
@@ -27,6 +32,7 @@ def record(action, command_id, details, result="success"):
                   "command_id": command_id, "result": result, "details": details})
     del audit[:-5000]
     audit_store.save(audit)
+    logger.info("audit action=%s command=%s result=%s details=%s", action, command_id, result, details)
 
 
 def order_data(response):
@@ -37,6 +43,9 @@ def order_data(response):
 async def place_market_with_retries(request, max_retries=3):
     attempts = []
     for attempt_no in range(1, max_retries + 2):
+        order_id = ""
+        logger.info("Market order attempt command=%s attempt=%d/%d", request.command_id,
+                    attempt_no, max_retries + 1)
         try:
             order_id, payload, response = await angel_client.place(request)
             state["orders"][order_id] = {**payload, "copy_trade_id": request.copy_trade_id}
@@ -62,8 +71,19 @@ async def place_market_with_retries(request, max_retries=3):
                     "request": {}, "response": {}, "attempts": attempts, "retry_count": 0,
                     "max_retries": max_retries, "retryable": False, "error": str(exc)}
         except Exception as exc:
+            if order_id:
+                attempts.append({"attempt": attempt_no, "order_id": order_id, "status": "PENDING",
+                                 "error": f"Status unavailable after placement: {exc}"})
+                logger.warning("Status unavailable after placement; retry blocked command=%s order_id=%s error=%s",
+                               request.command_id, order_id, exc)
+                return {"ok": True, "order_id": order_id, "status": "PENDING", "order": {},
+                        "request": state["orders"].get(order_id) or {}, "response": {},
+                        "attempts": attempts, "retry_count": attempt_no - 1,
+                        "max_retries": max_retries, "status_error": str(exc)}
             attempts.append({"attempt": attempt_no, "status": "REJECTED", "error": str(exc)})
         if attempt_no <= max_retries:
+            logger.warning("Retrying rejected market order command=%s next_attempt=%d",
+                           request.command_id, attempt_no + 1)
             await asyncio.sleep(1)
     last = attempts[-1]
     return {"ok": False, "order_id": last.get("order_id", ""), "status": "REJECTED",
@@ -81,28 +101,53 @@ async def health():
 
 @app.post("/v1/orders", dependencies=[Depends(authorize)])
 async def place_order(request: PlaceOrderRequest):
-    if request.command_id in state["commands"]:
-        return state["commands"][request.command_id]
-    try:
-        result = await place_market_with_retries(request) if request.order_type == "MARKET" else None
-        if result is None:
-            order_id, payload, response = await angel_client.place(request)
-            result = {"ok": True, "order_id": order_id, "status": "PENDING",
-                      "request": payload, "response": response, "order": {}, "attempts": [], "retry_count": 0}
-            state["orders"][order_id] = {**payload, "copy_trade_id": request.copy_trade_id}
-        order_id = result.get("order_id", "")
-        if request.tag == "copyentry":
-            state["trades"].setdefault(request.copy_trade_id, {})["entry_order_id"] = order_id
-        state["commands"][request.command_id] = result
-        state_store.save(state)
-        record("PLACE_ORDER", request.command_id, result, "success" if result.get("ok") else "failed")
-        return result
-    except Exception as exc:
-        result = {"ok": False, "error": str(exc)}
-        state["commands"][request.command_id] = result
-        state_store.save(state)
-        record("PLACE_ORDER", request.command_id, result, "failed")
-        raise HTTPException(status_code=502, detail=str(exc))
+    lock = command_locks.setdefault(request.command_id, asyncio.Lock())
+    async with lock:
+        if request.command_id in state["commands"]:
+            logger.info("Duplicate command replayed from cache command=%s", request.command_id)
+            return state["commands"][request.command_id]
+        logger.info("Place command received command=%s copy_trade=%s tag=%s type=%s product=%s",
+                    request.command_id, request.copy_trade_id, request.tag, request.order_type,
+                    request.product_type)
+        try:
+            if request.tag == "copyentry":
+                trade = state["trades"].get(request.copy_trade_id) or {}
+                existing_id = str(trade.get("entry_order_id") or "")
+                if existing_id:
+                    broker_response = await angel_client.order(existing_id)
+                    info = order_data(broker_response)
+                    status = str(info.get("orderstatus") or info.get("status") or "PENDING").upper()
+                    existing = {"ok": status not in {"REJECTED"}, "order_id": existing_id,
+                                "status": status, "order": info,
+                                "request": state["orders"].get(existing_id) or {},
+                                "response": broker_response, "attempts": [], "retry_count": 0,
+                                "max_retries": 3, "duplicate_prevented": True}
+                    state["commands"][request.command_id] = existing
+                    state_store.save(state)
+                    logger.warning("Duplicate copy entry prevented command=%s copy_trade=%s existing_order=%s status=%s",
+                                   request.command_id, request.copy_trade_id, existing_id, status)
+                    record("DUPLICATE_ENTRY_PREVENTED", request.command_id, existing)
+                    return existing
+            result = await place_market_with_retries(request) if request.order_type == "MARKET" else None
+            if result is None:
+                order_id, payload, response = await angel_client.place(request)
+                result = {"ok": True, "order_id": order_id, "status": "PENDING",
+                          "request": payload, "response": response, "order": {}, "attempts": [], "retry_count": 0}
+                state["orders"][order_id] = {**payload, "copy_trade_id": request.copy_trade_id}
+            order_id = result.get("order_id", "")
+            if request.tag == "copyentry":
+                state["trades"].setdefault(request.copy_trade_id, {})["entry_order_id"] = order_id
+            state["commands"][request.command_id] = result
+            state_store.save(state)
+            record("PLACE_ORDER", request.command_id, result, "success" if result.get("ok") else "failed")
+            return result
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            state["commands"][request.command_id] = result
+            state_store.save(state)
+            record("PLACE_ORDER", request.command_id, result, "failed")
+            logger.exception("Place command failed command=%s", request.command_id)
+            raise HTTPException(status_code=502, detail=str(exc))
 
 
 @app.get("/v1/orders/{order_id}", dependencies=[Depends(authorize)])
@@ -289,6 +334,8 @@ async def protection_monitor():
 
 @app.on_event("startup")
 async def start_monitor():
+    logger.info("Angel worker started account=%s product=CARRYFORWARD retry_policy=original_plus_3_rejected_only",
+                settings.WORKER_ACCOUNT_NAME)
     app.state.protection_task = asyncio.create_task(protection_monitor())
 
 
