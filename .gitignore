@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+worker_state.json
+worker_audit.json
+.venv/

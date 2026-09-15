@@ -1,0 +1,15 @@
+[Unit]
+Description=Angel One Copy Trading Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/angelone_order_worker
+ExecStart=/opt/angelone_order_worker/venv/bin/uvicorn main:app --host 0.0.0.0 --port 7100
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
