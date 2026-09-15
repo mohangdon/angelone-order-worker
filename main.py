@@ -34,6 +34,40 @@ def order_data(response):
     return data if isinstance(data, dict) else {}
 
 
+async def place_market_with_retries(request, max_retries=3):
+    attempts = []
+    for attempt_no in range(1, max_retries + 2):
+        try:
+            order_id, payload, response = await angel_client.place(request)
+            state["orders"][order_id] = {**payload, "copy_trade_id": request.copy_trade_id}
+            result = {"ok": True, "order_id": order_id, "status": "PENDING",
+                      "request": payload, "response": response, "order": {}}
+            deadline = asyncio.get_running_loop().time() + max(0, settings.ORDER_CONFIRM_TIMEOUT_SECONDS)
+            while asyncio.get_running_loop().time() < deadline:
+                broker_response = await angel_client.order(order_id)
+                info = order_data(broker_response)
+                status = str(info.get("orderstatus") or info.get("status") or "PENDING").upper()
+                result.update({"status": status, "order": info})
+                if status in TERMINAL:
+                    break
+                await asyncio.sleep(0.25)
+            attempts.append({"attempt": attempt_no, "order_id": order_id, "status": result["status"],
+                             "request": payload, "response": response, "order": result["order"]})
+            if result["status"] != "REJECTED":
+                return {**result, "attempts": attempts, "retry_count": attempt_no - 1,
+                        "max_retries": max_retries}
+        except Exception as exc:
+            attempts.append({"attempt": attempt_no, "status": "REJECTED", "error": str(exc)})
+        if attempt_no <= max_retries:
+            await asyncio.sleep(1)
+    last = attempts[-1]
+    return {"ok": False, "order_id": last.get("order_id", ""), "status": "REJECTED",
+            "order": last.get("order", {}), "request": last.get("request", {}),
+            "response": last.get("response", {}), "attempts": attempts,
+            "retry_count": max_retries, "max_retries": max_retries,
+            "error": last.get("error") or "Angel order rejected after 3 retries"}
+
+
 @app.get("/health")
 async def health():
     return {"ok": True, "account": settings.WORKER_ACCOUNT_NAME,
@@ -45,24 +79,18 @@ async def place_order(request: PlaceOrderRequest):
     if request.command_id in state["commands"]:
         return state["commands"][request.command_id]
     try:
-        order_id, payload, response = await angel_client.place(request)
-        result = {"ok": True, "order_id": order_id, "status": "PENDING",
-                  "request": payload, "response": response, "order": {}}
-        state["orders"][order_id] = {**payload, "copy_trade_id": request.copy_trade_id}
+        result = await place_market_with_retries(request) if request.order_type == "MARKET" else None
+        if result is None:
+            order_id, payload, response = await angel_client.place(request)
+            result = {"ok": True, "order_id": order_id, "status": "PENDING",
+                      "request": payload, "response": response, "order": {}, "attempts": [], "retry_count": 0}
+            state["orders"][order_id] = {**payload, "copy_trade_id": request.copy_trade_id}
+        order_id = result.get("order_id", "")
         if request.tag == "copyentry":
             state["trades"].setdefault(request.copy_trade_id, {})["entry_order_id"] = order_id
-        deadline = asyncio.get_running_loop().time() + max(0, settings.ORDER_CONFIRM_TIMEOUT_SECONDS)
-        while asyncio.get_running_loop().time() < deadline:
-            broker_response = await angel_client.order(order_id)
-            info = order_data(broker_response)
-            status = str(info.get("orderstatus") or info.get("status") or "PENDING").upper()
-            result.update({"status": status, "order": info})
-            if status in TERMINAL:
-                break
-            await asyncio.sleep(0.25)
         state["commands"][request.command_id] = result
         state_store.save(state)
-        record("PLACE_ORDER", request.command_id, {"order_id": order_id, "payload": payload, "status": result["status"]})
+        record("PLACE_ORDER", request.command_id, result, "success" if result.get("ok") else "failed")
         return result
     except Exception as exc:
         result = {"ok": False, "error": str(exc)}
@@ -80,9 +108,10 @@ async def get_order(order_id: str):
 
 @app.get("/v1/trades/{copy_trade_id}", dependencies=[Depends(authorize)])
 async def get_trade(copy_trade_id: str):
-    trade = state["trades"].get(copy_trade_id)
-    if not trade:
-        raise HTTPException(status_code=404, detail="Copy trade is not known to this worker")
+    try:
+        trade = await refresh_protection_trade(copy_trade_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     return {"ok": True, "copy_trade_id": copy_trade_id, "trade": trade}
 
 
@@ -140,8 +169,9 @@ async def set_protection(copy_trade_id: str, request: ProtectionRequest):
             "transaction_type": request.transaction_type, "quantity": request.quantity,
             "product_type": "INTRADAY"}
     if request.sl_price > 0:
+        sl_limit = round((request.sl_price * (0.95 if request.transaction_type == "SELL" else 1.05)) / 0.05) * 0.05
         sl_request = PlaceOrderRequest(command_id=request.command_id + "-sl", **base,
-            order_type="STOPLOSS_MARKET", trigger_price=request.sl_price, tag="copysl")
+            order_type="STOPLOSS_LIMIT", price=sl_limit, trigger_price=request.sl_price, tag="copysl")
         order_id, payload, response = await angel_client.place(sl_request)
         state["orders"][order_id] = {**payload, "copy_trade_id": copy_trade_id}
         trade["sl_order_id"] = order_id
@@ -191,41 +221,48 @@ async def exit_trade(copy_trade_id: str, request: ExitTradeRequest):
     place_request = PlaceOrderRequest(command_id=request.command_id + "-market", copy_trade_id=copy_trade_id,
         contract=request.contract, transaction_type=request.transaction_type, quantity=request.quantity,
         order_type="MARKET", product_type="INTRADAY", tag="copyexit")
-    order_id, payload, response = await angel_client.place(place_request)
-    state["orders"][order_id] = {**payload, "copy_trade_id": copy_trade_id}
+    result = await place_market_with_retries(place_request)
+    order_id = result.get("order_id", "")
     trade.update({"exit_order_id": order_id, "sl_order_id": "", "target_order_id": ""})
-    result = {"ok": True, "order_id": order_id, "status": "PENDING", "request": payload, "response": response}
     state["commands"][request.command_id] = result
     state_store.save(state)
-    record("EXIT_TRADE", request.command_id, result)
+    record("EXIT_TRADE", request.command_id, result, "success" if result.get("ok") else "failed")
     return result
+
+
+async def refresh_protection_trade(copy_trade_id):
+    trade = state["trades"].get(copy_trade_id)
+    if not trade:
+        raise ValueError("Copy trade is not known to this worker")
+    for key, other in (("sl_order_id", "target_order_id"), ("target_order_id", "sl_order_id")):
+        order_id = str(trade.get(key) or "")
+        if not order_id:
+            continue
+        info = order_data(await angel_client.order(order_id))
+        status = str(info.get("orderstatus") or info.get("status") or "").upper()
+        if status in {"COMPLETE", "TRADED", "FILLED"}:
+            sibling = str(trade.get(other) or "")
+            if sibling:
+                known = state["orders"].get(sibling) or {}
+                await angel_client.call("cancelOrder", sibling, known.get("variety") or "NORMAL")
+            trade.update({"closed_by": "sl" if key.startswith("sl") else "target",
+                          "exit_order_id": order_id, "exit_order": info,
+                          "sl_order_id": "", "target_order_id": ""})
+            state_store.save(state)
+            break
+    return trade
 
 
 async def protection_monitor():
     while True:
         try:
-            for trade_id, trade in list(state["trades"].items()):
-                for key, other in (("sl_order_id", "target_order_id"), ("target_order_id", "sl_order_id")):
-                    order_id = str(trade.get(key) or "")
-                    if not order_id:
-                        continue
-                    info = order_data(await angel_client.order(order_id))
-                    status = str(info.get("orderstatus") or info.get("status") or "").upper()
-                    if status in {"COMPLETE", "TRADED", "FILLED"}:
-                        sibling = str(trade.get(other) or "")
-                        if sibling:
-                            known = state["orders"].get(sibling) or {}
-                            await angel_client.call("cancelOrder", sibling, known.get("variety") or "NORMAL")
-                        trade.update({"closed_by": "sl" if key.startswith("sl") else "target",
-                                      "exit_order_id": order_id, "exit_order": info,
-                                      "sl_order_id": "", "target_order_id": ""})
-                        state_store.save(state)
-                        break
+            for trade_id in list(state["trades"]):
+                await refresh_protection_trade(trade_id)
         except asyncio.CancelledError:
             raise
         except Exception:
             pass
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(30)
 
 
 @app.on_event("startup")

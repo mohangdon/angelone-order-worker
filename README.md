@@ -15,6 +15,8 @@ Angel One validates the source IP of place/modify/cancel requests for static-IP 
 
 API operations are idempotent by `command_id`. Entry and exit responses include the exact broker request, raw response, order ID and current order status. Protection synchronization creates the exact master SL/TSL and target prices; the local monitor cancels the sibling order when either one fills.
 
+Entry and exit use Angel One `MARKET` orders. A rejected market order is replaced up to three times after the original attempt. Every attempt is returned to the master and written to the audit trail. SL/TSL uses `STOPLOSS_LIMIT` with a 5% execution buffer; target uses `LIMIT`. The worker checks protective orders every 30 seconds, while a master SL/TSL or target event triggers an immediate on-demand broker-status refresh.
+
 Official references:
 
 - https://smartapi.angelone.in/docs/Instruments
