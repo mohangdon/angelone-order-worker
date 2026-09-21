@@ -23,8 +23,9 @@ class AngelClient:
     def __init__(self):
         self.api = None
         self.login_lock = asyncio.Lock()
-        self.instruments = []
-        self.instrument_date = ""
+        self.instrument_index = {}  # fast lookup table built from the scrip master
+        self.instrument_lock = asyncio.Lock()  # makes sure only ONE download runs at a time
+        self.instrument_loaded_at = None
         self.unique_order_ids = {}
 
     async def login(self):
@@ -52,17 +53,52 @@ class AngelClient:
             await self.login()
             return await asyncio.to_thread(getattr(self.api, method), *args)
 
-    async def load_instruments(self):
-        today = datetime.now().strftime("%Y-%m-%d")
-        if self.instruments and self.instrument_date == today:
+    async def load_instruments(self, force=False):
+        # Already loaded? Return instantly. No download, no waiting.
+        # (force=True is only used by the background refresh to get a fresh copy.)
+        if self.instrument_index and not force:
             return
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(INSTRUMENT_URL)
-            response.raise_for_status()
-            rows = response.json()
-        self.instruments = rows if isinstance(rows, list) else []
-        self.instrument_date = today
-        logger.info("Instrument master loaded rows=%d date=%s", len(self.instruments), today)
+        async with self.instrument_lock:
+            # Check again: another request may have finished loading while we waited our turn
+            if self.instrument_index and not force:
+                return
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(INSTRUMENT_URL)
+                response.raise_for_status()
+                # The file is huge, so parse and index it in a side thread (keeps orders responsive)
+                rows = await asyncio.to_thread(response.json)
+            if not isinstance(rows, list) or not rows:
+                # Keep the old copy (if any) instead of replacing it with garbage
+                raise RuntimeError("Scrip master download was not a valid list")
+            index = await asyncio.to_thread(self.build_index, rows)
+            self.instrument_index = index  # swap in the new table in one step
+            self.instrument_loaded_at = datetime.now()
+            logger.info("Instrument master loaded rows=%d option_contracts=%d",
+                        len(rows), sum(len(v) for v in index.values()))
+
+    @staticmethod
+    def index_key(exchange, underlying, expiry, strike, option):
+        # One "address" per contract: exchange + underlying + expiry + strike + CE/PE
+        return (str(exchange or "").upper(), str(underlying or "").upper(),
+                AngelClient.normalized_expiry(expiry), round(float(strike), 2), str(option or "").upper())
+
+    @staticmethod
+    def build_index(rows):
+        # Runs once per load. Turns ~100k rows into a dictionary so each order is a direct lookup.
+        index = {}
+        for row in rows:
+            if str(row.get("exch_seg") or "").upper() not in ("NFO", "BFO"):
+                continue
+            option = str(row.get("symbol") or "").upper()[-2:]
+            if option not in ("CE", "PE"):
+                continue
+            try:
+                key = AngelClient.index_key(row.get("exch_seg"), row.get("name"), row.get("expiry"),
+                                            AngelClient.normalized_strike(row.get("strike")), option)
+            except (TypeError, ValueError):
+                continue  # skip any malformed row
+            index.setdefault(key, []).append(row)
+        return index
 
     @staticmethod
     def normalized_expiry(value):
@@ -80,20 +116,10 @@ class AngelClient:
         return number / 100 if number > 100000 else number
 
     async def resolve(self, contract):
-        await self.load_instruments()
-        candidates = []
-        for row in self.instruments:
-            if str(row.get("exch_seg") or "").upper() != contract.exchange:
-                continue
-            if str(row.get("name") or "").upper() != contract.underlying.upper():
-                continue
-            if self.normalized_expiry(row.get("expiry")) != self.normalized_expiry(contract.expiry):
-                continue
-            if abs(self.normalized_strike(row.get("strike")) - contract.strike) > 0.01:
-                continue
-            if not str(row.get("symbol") or "").upper().endswith(contract.option):
-                continue
-            candidates.append(row)
+        await self.load_instruments()  # instant when already loaded at startup
+        key = self.index_key(contract.exchange, contract.underlying, contract.expiry,
+                             contract.strike, contract.option)
+        candidates = self.instrument_index.get(key, [])
         if len(candidates) != 1:
             raise ContractResolutionError(f"Expected one Angel contract, found {len(candidates)} for {contract.model_dump()}")
         row = candidates[0]

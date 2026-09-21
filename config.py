@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     WORKER_HOST: str = "0.0.0.0"
     WORKER_PORT: int = 7100
     ORDER_CONFIRM_TIMEOUT_SECONDS: float = 3.0
+    # How often (in hours) to quietly re-download the scrip master in the background.
+    # Set to 0 to turn the refresh off (then it only loads at startup).
+    INSTRUMENT_REFRESH_HOURS: float = 6.0
 
     class Config:
         env_file = ".env"

@@ -350,14 +350,38 @@ async def protection_monitor():
         await asyncio.sleep(30)
 
 
+async def instrument_refresher():
+    # Keeps the scrip master fresh (new weekly expiries etc.) without touching order requests.
+    # If a refresh fails, the previous copy keeps working and we try again next round.
+    while True:
+        await asyncio.sleep(settings.INSTRUMENT_REFRESH_HOURS * 3600)
+        try:
+            await angel_client.load_instruments(force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Scrip master refresh failed; keeping the previous copy")
+
+
 @app.on_event("startup")
 async def start_monitor():
     logger.info("Angel worker started account=%s product=CARRYFORWARD retry_policy=original_plus_3_rejected_only",
                 settings.WORKER_ACCOUNT_NAME)
+    # Load the scrip master ONCE here, before any order can arrive
+    try:
+        await angel_client.load_instruments()
+    except Exception:
+        # Don't stop the service; the first order will try loading again
+        logger.exception("Scrip master load failed at startup")
     app.state.protection_task = asyncio.create_task(protection_monitor())
+    app.state.instrument_task = None
+    if settings.INSTRUMENT_REFRESH_HOURS > 0:
+        app.state.instrument_task = asyncio.create_task(instrument_refresher())
 
 
 @app.on_event("shutdown")
 async def stop_monitor():
-    app.state.protection_task.cancel()
-    await asyncio.gather(app.state.protection_task, return_exceptions=True)
+    tasks = [t for t in (app.state.protection_task, app.state.instrument_task) if t]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
