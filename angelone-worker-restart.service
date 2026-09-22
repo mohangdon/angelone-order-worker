@@ -1,0 +1,9 @@
+[Unit]
+Description=Restart Angel One order worker to refresh auth token
+# Only makes sense to run if the main worker unit exists
+Requires=angelone-order-worker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/angelone_order_worker/restart_worker.sh
+User=root

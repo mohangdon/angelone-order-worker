@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily 8:30 AM restart trigger for angelone-order-worker
+
+[Timer]
+# Runs every day at 08:30 server local time
+OnCalendar=*-*-* 08:30:00
+# If the server was down at 8:30, run it as soon as it's back up
+Persistent=true
+# Small random delay to avoid exact-second collisions with other jobs
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
