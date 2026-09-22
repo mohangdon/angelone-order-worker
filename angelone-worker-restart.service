@@ -1,7 +1,10 @@
 [Unit]
 Description=Restart Angel One order worker to refresh auth token
-# Only makes sense to run if the main worker unit exists
-Requires=angelone-order-worker.service
+# No Wants=/Requires= here on purpose: our own ExecStart script already
+# calls "systemctl restart angelone-order-worker.service" directly.
+# Declaring a dependency here caused systemd to queue a second,
+# conflicting start job for the same unit at the same time, which
+# systemd resolved by SIGTERM-killing this script mid-run.
 
 [Service]
 Type=oneshot
