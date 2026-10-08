@@ -19,5 +19,12 @@ Entry and exit use Angel One `MARKET` orders. A rejected market order is replace
 
 Official references:
 
+MCX option contracts are supported alongside NFO/BFO. The master can send CRUDEOILM,
+GOLDM, SILVERM and NATGASMINI contracts using exchange MCX. The worker resolves
+the exact expiry/strike/CE-or-PE from Angel's daily instrument master, including
+MCX strikes quoted in paise, and validates whole contract lots before submission.
+GOLDM/SILVERM order and trigger prices are snapped to their 0.50 tick; CRUDEOILM
+and NATGASMINI use 0.05. The account must have the MCX segment enabled.
+
 - https://smartapi.angelone.in/docs/Instruments
 - https://github.com/angel-one/smartapi-python

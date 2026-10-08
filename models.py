@@ -7,7 +7,7 @@ class Contract(BaseModel):
     expiry: str
     strike: float
     option: Literal["CE", "PE"]
-    exchange: Literal["NFO", "BFO"]
+    exchange: Literal["NFO", "BFO", "MCX"]
 
 
 class PlaceOrderRequest(BaseModel):

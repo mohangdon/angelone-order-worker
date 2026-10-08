@@ -23,6 +23,46 @@ class WorkerApiTests(unittest.TestCase):
     def test_requires_worker_token(self):
         self.assertEqual(self.client.get("/v1/audit").status_code, 401)
 
+    def test_mcx_contract_validation_and_scaled_strikes(self):
+        from models import Contract
+        for name, strike, lot in (("CRUDEOILM", 7500, 10), ("GOLDM", 149500, 100),
+                                 ("SILVERM", 277000, 5), ("NATGASMINI", 165, 250)):
+            contract = Contract(underlying=name, expiry="15OCT26", strike=strike, option="CE", exchange="MCX")
+            rows = [{"exch_seg": "MCX", "name": name, "symbol": f"{name}15OCT26{strike}CE",
+                     "expiry": "15OCT2026", "strike": str(strike * 100), "lotsize": str(lot), "token": "1"}]
+            index = AngelClient.build_index(rows)
+            self.assertIn(AngelClient.index_key("MCX", name, contract.expiry, strike, "CE"), index)
+
+    def test_mcx_api_entry_and_idempotency(self):
+        self.payload["contract"] = {"underlying": "NATGASMINI", "expiry": "23OCT26", "strike": 165,
+                                    "option": "CE", "exchange": "MCX"}
+        self.payload["quantity"] = 250
+        placed = AsyncMock(return_value=("MCX1", {"exchange": "MCX", "quantity": "250"}, {"status": True}))
+        order = AsyncMock(return_value={"data": {"orderstatus": "complete", "averageprice": "10"}})
+        with patch.object(main.angel_client, "place", placed), patch.object(main.angel_client, "order", order), \
+             patch.object(main.state_store, "save"), patch.object(main.audit_store, "save"):
+            self.assertEqual(self.client.post("/v1/orders", headers=self.headers, json=self.payload).status_code, 200)
+            self.client.post("/v1/orders", headers=self.headers, json=self.payload)
+        placed.assert_awaited_once()
+
+    def test_mcx_place_snaps_gold_prices_and_blocks_fractional_lots(self):
+        import asyncio
+        from models import PlaceOrderRequest
+        client = AngelClient()
+        client.resolve = AsyncMock(return_value={"exchange": "MCX", "tradingsymbol": "GOLDM29OCT26149500CE",
+                                               "symboltoken": "1", "lotsize": 100})
+        client.call = AsyncMock(return_value={"data": {"orderid": "1"}})
+        body = {**self.payload, "contract": {"underlying": "GOLDM", "expiry": "29OCT26", "strike": 149500,
+                                             "option": "CE", "exchange": "MCX"}, "quantity": 100,
+                "order_type": "STOPLOSS_LIMIT", "price": 95.26, "trigger_price": 100.24}
+        _, payload, _ = asyncio.run(client.place(PlaceOrderRequest(**body)))
+        self.assertEqual(float(payload["price"]), 95.5)
+        self.assertEqual(float(payload["triggerprice"]), 100)
+        client.call.reset_mock()
+        with self.assertRaises(ContractResolutionError):
+            asyncio.run(client.place(PlaceOrderRequest(**{**body, "quantity": 99})))
+        client.call.assert_not_awaited()
+
     def test_flattrade_and_angel_expiry_formats_normalize_identically(self):
         self.assertEqual(AngelClient.normalized_expiry("15SEP26"), "2026-09-15")
         self.assertEqual(AngelClient.normalized_expiry("15SEP2026"), "2026-09-15")

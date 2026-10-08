@@ -87,14 +87,15 @@ class AngelClient:
         # Runs once per load. Turns ~100k rows into a dictionary so each order is a direct lookup.
         index = {}
         for row in rows:
-            if str(row.get("exch_seg") or "").upper() not in ("NFO", "BFO"):
+            if str(row.get("exch_seg") or "").upper() not in ("NFO", "BFO", "MCX"):
                 continue
             option = str(row.get("symbol") or "").upper()[-2:]
             if option not in ("CE", "PE"):
                 continue
             try:
                 key = AngelClient.index_key(row.get("exch_seg"), row.get("name"), row.get("expiry"),
-                                            AngelClient.normalized_strike(row.get("strike")), option)
+                                            (float(row.get("strike") or 0) / 100 if str(row.get("exch_seg")).upper() == "MCX"
+                                             else AngelClient.normalized_strike(row.get("strike"))), option)
             except (TypeError, ValueError):
                 continue  # skip any malformed row
             index.setdefault(key, []).append(row)
@@ -131,11 +132,16 @@ class AngelClient:
 
     async def place(self, request):
         symbol = await self.resolve(request.contract)
+        tick = (0.5 if request.contract.underlying in {"GOLDM", "SILVERM"} else 0.05) if request.contract.exchange == "MCX" else 0.05
+        if request.contract.exchange == "MCX" and (symbol["lotsize"] <= 0 or request.quantity % symbol["lotsize"]):
+            raise ContractResolutionError("MCX quantity must be a multiple of the contract lot size")
+        price = round(round(float(request.price or 0) / tick) * tick, 2)
+        trigger = round(round(float(request.trigger_price or 0) / tick) * tick, 2)
         payload = {
             "variety": "STOPLOSS" if request.order_type.startswith("STOPLOSS") else "NORMAL", **symbol,
             "transactiontype": request.transaction_type, "ordertype": request.order_type,
-            "producttype": request.product_type, "duration": "DAY", "price": str(request.price or 0),
-            "triggerprice": str(request.trigger_price or 0), "squareoff": "0", "stoploss": "0",
+            "producttype": request.product_type, "duration": "DAY", "price": str(price if request.contract.exchange == "MCX" else request.price or 0),
+            "triggerprice": str(trigger if request.contract.exchange == "MCX" else request.trigger_price or 0), "squareoff": "0", "stoploss": "0",
             "quantity": str(request.quantity), "ordertag": request.tag[:15],
         }
         logger.info("Place order request command=%s copy_trade=%s payload=%s",
