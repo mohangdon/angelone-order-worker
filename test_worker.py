@@ -78,6 +78,43 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(first.json()["order_id"], "ORDER1")
         self.assertEqual(placed.await_count, 1)
+        self.assertTrue(first.json()["timing"]["fill_confirmed"])
+        self.assertIn("placement_acknowledged_at", first.json()["timing"])
+        self.assertGreaterEqual(first.json()["timing"]["fill_confirmation_duration_ms"], 0)
+        self.assertEqual(first.json()["timing"], second.json()["timing"])
+
+    def test_unconfirmed_order_has_separate_placement_and_fill_wait(self):
+        placed = AsyncMock(return_value=("OPEN1", {"quantity": "65"}, {"status": True}))
+        order = AsyncMock(return_value={"data": {"orderstatus": "open", "filledshares": "0"}})
+        with patch.object(main.angel_client, "place", placed), patch.object(main.angel_client, "order", order), \
+             patch.object(main.settings, "ORDER_CONFIRM_TIMEOUT_SECONDS", 0), \
+             patch.object(main.state_store, "save"), patch.object(main.audit_store, "save"):
+            response = self.client.post("/v1/orders", headers=self.headers, json=self.payload)
+        result = response.json()
+        self.assertFalse(result["timing"]["fill_confirmed"])
+        self.assertIn("placement_duration_ms", result["timing"])
+        self.assertIn("fill_confirmation_duration_ms", result["timing"])
+        self.assertEqual(result["attempts"][0]["timing"], result["timing"])
+        placed.assert_awaited_once()
+
+    def test_placement_latency_is_not_fill_confirmation_latency(self):
+        import asyncio
+
+        async def place(_request):
+            await asyncio.sleep(0.01)
+            return "TIMED1", {"quantity": "65"}, {"status": True}
+
+        async def order(_id):
+            await asyncio.sleep(0.02)
+            return {"data": {"orderstatus": "complete"}}
+
+        with patch.object(main.angel_client, "place", side_effect=place), \
+             patch.object(main.angel_client, "order", side_effect=order), \
+             patch.object(main.state_store, "save"), patch.object(main.audit_store, "save"):
+            result = self.client.post("/v1/orders", headers=self.headers, json=self.payload).json()
+        self.assertGreaterEqual(result["timing"]["placement_duration_ms"], 5)
+        self.assertGreaterEqual(result["timing"]["fill_confirmation_duration_ms"], 15)
+        self.assertTrue(result["timing"]["fill_confirmed"])
 
     def test_rejected_market_order_is_retried_three_times(self):
         placed = AsyncMock(side_effect=[

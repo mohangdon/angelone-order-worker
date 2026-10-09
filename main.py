@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import secrets
+import time
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -40,17 +41,30 @@ def order_data(response):
     return data if isinstance(data, dict) else {}
 
 
+async def place_with_timing(request):
+    started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    started = time.perf_counter()
+    placed = await angel_client.place(request)
+    timing = {"placement_started_at": started_at,
+              "placement_acknowledged_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+              "placement_duration_ms": round((time.perf_counter() - started) * 1000, 1)}
+    return (*placed, timing)
+
+
 async def place_market_with_retries(request, max_retries=3):
     attempts = []
     for attempt_no in range(1, max_retries + 2):
         order_id = ""
+        timing = {}
         logger.info("Market order attempt command=%s attempt=%d/%d", request.command_id,
                     attempt_no, max_retries + 1)
         try:
-            order_id, payload, response = await angel_client.place(request)
+            order_id, payload, response, timing = await place_with_timing(request)
+            confirmation_started = time.perf_counter()
             state["orders"][order_id] = {**payload, "copy_trade_id": request.copy_trade_id}
             result = {"ok": True, "order_id": order_id, "status": "PENDING",
-                      "request": payload, "response": response, "order": {}}
+                      "request": payload, "response": response, "order": {}, "timing": timing}
+            timing["fill_confirmation_started_at"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             deadline = asyncio.get_running_loop().time() + max(0, settings.ORDER_CONFIRM_TIMEOUT_SECONDS)
             while asyncio.get_running_loop().time() < deadline:
                 broker_response = await angel_client.order(order_id)
@@ -60,8 +74,11 @@ async def place_market_with_retries(request, max_retries=3):
                 if status in TERMINAL:
                     break
                 await asyncio.sleep(1)
+            timing.update({"fill_confirmation_completed_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                           "fill_confirmation_duration_ms": round((time.perf_counter() - confirmation_started) * 1000, 1),
+                           "fill_confirmed": result["status"] in {"COMPLETE", "TRADED", "FILLED"}})
             attempts.append({"attempt": attempt_no, "order_id": order_id, "status": result["status"],
-                             "request": payload, "response": response, "order": result["order"]})
+                             "request": payload, "response": response, "order": result["order"], "timing": dict(timing)})
             if result["status"] != "REJECTED":
                 return {**result, "attempts": attempts, "retry_count": attempt_no - 1,
                         "max_retries": max_retries}
@@ -72,6 +89,9 @@ async def place_market_with_retries(request, max_retries=3):
                     "max_retries": max_retries, "retryable": False, "error": str(exc)}
         except Exception as exc:
             if order_id:
+                timing.update({"fill_confirmation_completed_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                               "fill_confirmation_duration_ms": round((time.perf_counter() - confirmation_started) * 1000, 1),
+                               "fill_confirmed": False})
                 attempts.append({"attempt": attempt_no, "order_id": order_id, "status": "PENDING",
                                  "error": f"Status unavailable after placement: {exc}"})
                 logger.warning("Status unavailable after placement; retry blocked command=%s order_id=%s error=%s",
@@ -79,7 +99,7 @@ async def place_market_with_retries(request, max_retries=3):
                 return {"ok": True, "order_id": order_id, "status": "PENDING", "order": {},
                         "request": state["orders"].get(order_id) or {}, "response": {},
                         "attempts": attempts, "retry_count": attempt_no - 1,
-                        "max_retries": max_retries, "status_error": str(exc)}
+                        "max_retries": max_retries, "status_error": str(exc), "timing": timing}
             attempts.append({"attempt": attempt_no, "status": "REJECTED", "error": str(exc)})
         if attempt_no <= max_retries:
             logger.warning("Retrying rejected market order command=%s next_attempt=%d",
@@ -89,6 +109,7 @@ async def place_market_with_retries(request, max_retries=3):
     return {"ok": False, "order_id": last.get("order_id", ""), "status": "REJECTED",
             "order": last.get("order", {}), "request": last.get("request", {}),
             "response": last.get("response", {}), "attempts": attempts,
+            "timing": last.get("timing", {}),
             "retry_count": max_retries, "max_retries": max_retries,
             "error": last.get("error") or "Angel order rejected after 3 retries"}
 
@@ -130,9 +151,10 @@ async def place_order(request: PlaceOrderRequest):
                     return existing
             result = await place_market_with_retries(request) if request.order_type == "MARKET" else None
             if result is None:
-                order_id, payload, response = await angel_client.place(request)
+                order_id, payload, response, timing = await place_with_timing(request)
                 result = {"ok": True, "order_id": order_id, "status": "PENDING",
-                          "request": payload, "response": response, "order": {}, "attempts": [], "retry_count": 0}
+                          "request": payload, "response": response, "order": {}, "attempts": [], "retry_count": 0,
+                          "timing": timing}
                 state["orders"][order_id] = {**payload, "copy_trade_id": request.copy_trade_id}
             order_id = result.get("order_id", "")
             if request.tag == "copyentry":

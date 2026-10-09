@@ -17,6 +17,8 @@ API operations are idempotent by `command_id`. Entry and exit responses include 
 
 Entry and exit use Angel One `MARKET` orders. A rejected market order is replaced up to three times after the original attempt. Every attempt is returned to the master and written to the audit trail. SL/TSL uses `STOPLOSS_LIMIT` with a 5% execution buffer; target uses `LIMIT`. The worker checks protective orders every 30 seconds, while a master SL/TSL or target event triggers an immediate on-demand broker-status refresh.
 
+Order submission responses include `timing`: placement start/acknowledgement timestamps and duration, followed by fill-confirmation timestamps, duration and `fill_confirmed`. Placement timing includes contract resolution and the broker placement call; acknowledgement does not mean the order filled. Market-order fill polling and retry behavior are unchanged. The final HTTP response may arrive seconds after the placement acknowledgement while the worker checks order status.
+
 Official references:
 
 MCX option contracts are supported alongside NFO/BFO. The master can send CRUDEOILM,
