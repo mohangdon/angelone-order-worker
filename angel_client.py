@@ -1,6 +1,8 @@
 import asyncio
 import logging
-from datetime import datetime
+import time
+from contextvars import ContextVar
+from datetime import datetime, timezone
 
 import httpx
 import pyotp
@@ -13,6 +15,7 @@ INSTRUMENT_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAP
 TERMINAL = {"COMPLETE", "TRADED", "FILLED", "REJECTED", "CANCELLED", "CANCELED"}
 logger = logging.getLogger("angel_worker.client")
 logger.setLevel(logging.INFO)
+placement_sdk_timing = ContextVar("placement_sdk_timing", default=None)
 
 
 class ContractResolutionError(ValueError):
@@ -45,13 +48,34 @@ class AngelClient:
     async def call(self, method, *args):
         await self.login()
         try:
-            return await asyncio.to_thread(getattr(self.api, method), *args)
+            return await self._execute(method, *args)
         except Exception as exc:
             if not any(word in str(exc).lower() for word in ("token", "session", "jwt")):
                 raise
             self.api = None
             await self.login()
-            return await asyncio.to_thread(getattr(self.api, method), *args)
+            return await self._execute(method, *args)
+
+    async def _execute(self, method, *args):
+        queued = time.perf_counter()
+        timing = placement_sdk_timing.get()
+        function = getattr(self.api, method)
+
+        def execute():
+            started = time.perf_counter()
+            started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            try:
+                return function(*args)
+            finally:
+                elapsed = round((time.perf_counter() - started) * 1000, 1)
+                queue_ms = round((started - queued) * 1000, 1)
+                if timing is not None:
+                    timing.update(sdk_execution_started_at=started_at,
+                                  sdk_execution_completed_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                                  sdk_queue_duration_ms=queue_ms, sdk_execution_duration_ms=elapsed)
+                logger.info("SDK timing method=%s queue_ms=%s execution_ms=%s", method, queue_ms, elapsed)
+
+        return await asyncio.to_thread(execute)
 
     async def load_instruments(self, force=False):
         # Already loaded? Return instantly. No download, no waiting.

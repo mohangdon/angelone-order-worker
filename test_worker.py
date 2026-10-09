@@ -11,6 +11,10 @@ class WorkerApiTests(unittest.TestCase):
     def setUp(self):
         main.settings.WORKER_API_TOKEN = "test-token"
         main.state = {"commands": {}, "orders": {}, "trades": {}}
+        main.command_locks = {}
+        self.state_save = patch.object(main.state_store, "save_async", AsyncMock()).start()
+        self.audit_save = patch.object(main.audit_store, "save_async", AsyncMock()).start()
+        self.addCleanup(patch.stopall)
         self.client = TestClient(main.app)
         self.headers = {"Authorization": "Bearer test-token"}
         self.payload = {
@@ -94,7 +98,10 @@ class WorkerApiTests(unittest.TestCase):
         self.assertFalse(result["timing"]["fill_confirmed"])
         self.assertIn("placement_duration_ms", result["timing"])
         self.assertIn("fill_confirmation_duration_ms", result["timing"])
-        self.assertEqual(result["attempts"][0]["timing"], result["timing"])
+        for key, value in result["attempts"][0]["timing"].items():
+            self.assertEqual(value, result["timing"][key])
+        self.assertIn("state_save_duration_ms", result["timing"])
+        self.assertIn("audit_save_duration_ms", result["timing"])
         placed.assert_awaited_once()
 
     def test_placement_latency_is_not_fill_confirmation_latency(self):
@@ -171,6 +178,130 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(placed.await_args_list[0].args[0].order_type, "STOPLOSS_LIMIT")
         self.assertEqual(placed.await_args_list[1].args[0].order_type, "LIMIT")
+
+    def test_response_waits_for_durable_state_and_audit(self):
+        import asyncio
+        completed = []
+
+        async def saved_state(_value):
+            await asyncio.sleep(0.01)
+            completed.append("state")
+
+        async def saved_audit(_value):
+            self.assertEqual(completed, ["state"])
+            completed.append("audit")
+
+        with patch.object(main.angel_client, "place", AsyncMock(return_value=("DURABLE", {}, {}))), \
+             patch.object(main.angel_client, "order", AsyncMock(return_value={"data": {"status": "COMPLETE"}})), \
+             patch.object(main.state_store, "save_async", side_effect=saved_state), \
+             patch.object(main.audit_store, "save_async", side_effect=saved_audit):
+            response = self.client.post("/v1/orders", headers=self.headers, json=self.payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(completed, ["state", "audit"])
+
+    def test_fill_poll_sleep_does_not_exceed_remaining_timeout(self):
+        import asyncio
+        from models import PlaceOrderRequest
+        delays = []
+        real_sleep = asyncio.sleep
+
+        async def sleep(delay):
+            delays.append(delay)
+            await real_sleep(delay)
+
+        with patch.object(main.angel_client, "place", AsyncMock(return_value=("OPEN", {}, {}))), \
+             patch.object(main.angel_client, "order", AsyncMock(return_value={"data": {"status": "OPEN"}})), \
+             patch.object(main.settings, "ORDER_CONFIRM_TIMEOUT_SECONDS", 0.02), \
+             patch.object(main.asyncio, "sleep", side_effect=sleep):
+            result = asyncio.run(main.place_market_with_retries(PlaceOrderRequest(**self.payload)))
+        self.assertTrue(delays)
+        self.assertLessEqual(max(delays), 0.02)
+        self.assertEqual(result["status"], "OPEN")
+
+
+class StoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sdk_execution_has_separate_queue_and_execution_timing(self):
+        import time
+        from types import SimpleNamespace
+        from angel_client import placement_sdk_timing
+
+        def fake_call():
+            time.sleep(0.01)
+            return {'status': True}
+
+        client = AngelClient()
+        client.api = SimpleNamespace(placeOrderFullResponse=fake_call)
+        timing = {}
+        token = placement_sdk_timing.set(timing)
+        try:
+            self.assertEqual(await client.call('placeOrderFullResponse'), {'status': True})
+        finally:
+            placement_sdk_timing.reset(token)
+        self.assertGreaterEqual(timing['sdk_execution_duration_ms'], 5)
+        self.assertGreaterEqual(timing['sdk_queue_duration_ms'], 0)
+        self.assertIn('sdk_execution_completed_at', timing)
+
+    async def test_cancelled_save_finishes_write_before_releasing_lock(self):
+        import asyncio
+        import tempfile
+        import threading
+        from pathlib import Path
+        from store import JsonStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonStore(Path(directory) / 'state.json')
+            started, release = threading.Event(), threading.Event()
+            original = store._write
+
+            def write(payload):
+                started.set()
+                release.wait(2)
+                original(payload)
+
+            store._write = write
+            task = asyncio.create_task(store.save_async({'order_id': 'A'}))
+            self.assertTrue(await asyncio.to_thread(started.wait, 1))
+            task.cancel()
+            await asyncio.sleep(0.01)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(store.load({}), {'order_id': 'A'})
+
+    async def test_ordered_snapshots_do_not_block_loop_or_lose_updates(self):
+        import asyncio
+        import json
+        import tempfile
+        import threading
+        from pathlib import Path
+        from store import JsonStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonStore(Path(directory) / "state.json")
+            started, release = threading.Event(), threading.Event()
+            written = []
+            original = store._write
+
+            def write(payload):
+                if not written:
+                    started.set()
+                    release.wait(2)
+                original(payload)
+                written.append(json.loads(payload))
+
+            store._write = write
+            state = {"orders": ["A"]}
+            first = asyncio.create_task(store.save_async(state))
+            self.assertTrue(await asyncio.to_thread(started.wait, 1))
+            state["orders"].append("B")
+            second = asyncio.create_task(store.save_async(state))
+            await asyncio.sleep(0.01)
+            self.assertFalse(first.done())
+            release.set()
+            await asyncio.gather(first, second)
+            self.assertEqual(written, [{"orders": ["A"]}, {"orders": ["A", "B"]}])
+            self.assertEqual(store.load({}), state)
 
 
 if __name__ == "__main__":

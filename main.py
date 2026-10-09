@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 
-from angel_client import TERMINAL, ContractResolutionError, angel_client
+from angel_client import TERMINAL, ContractResolutionError, angel_client, placement_sdk_timing
 from config import settings
 from models import CommandRequest, ExitTradeRequest, ModifyOrderRequest, PlaceOrderRequest, ProtectionRequest
 from store import JsonStore
@@ -28,12 +28,25 @@ def authorize(authorization: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Invalid worker token")
 
 
-def record(action, command_id, details, result="success"):
+async def persist_state(result=None):
+    started = time.perf_counter()
+    await state_store.save_async(state)
+    elapsed = round((time.perf_counter() - started) * 1000, 1)
+    if result is not None:
+        result.setdefault("timing", {})["state_save_duration_ms"] = elapsed
+    logger.info("State saved duration_ms=%s", elapsed)
+
+
+async def record(action, command_id, details, result="success"):
     audit.append({"timestamp": datetime.now(timezone.utc).isoformat(), "action": action,
                   "command_id": command_id, "result": result, "details": details})
     del audit[:-5000]
-    audit_store.save(audit)
-    logger.info("audit action=%s command=%s result=%s details=%s", action, command_id, result, details)
+    started = time.perf_counter()
+    await audit_store.save_async(audit)
+    elapsed = round((time.perf_counter() - started) * 1000, 1)
+    details.setdefault("timing", {})["audit_save_duration_ms"] = elapsed
+    logger.info("audit action=%s command=%s result=%s order_id=%s status=%s timing=%s",
+                action, command_id, result, details.get("order_id", ""), details.get("status", ""), details["timing"])
 
 
 def order_data(response):
@@ -44,10 +57,16 @@ def order_data(response):
 async def place_with_timing(request):
     started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     started = time.perf_counter()
-    placed = await angel_client.place(request)
+    sdk_timing = {}
+    token = placement_sdk_timing.set(sdk_timing)
+    try:
+        placed = await angel_client.place(request)
+    finally:
+        placement_sdk_timing.reset(token)
     timing = {"placement_started_at": started_at,
               "placement_acknowledged_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
               "placement_duration_ms": round((time.perf_counter() - started) * 1000, 1)}
+    timing.update(sdk_timing)
     return (*placed, timing)
 
 
@@ -67,13 +86,19 @@ async def place_market_with_retries(request, max_retries=3):
             timing["fill_confirmation_started_at"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             deadline = asyncio.get_running_loop().time() + max(0, settings.ORDER_CONFIRM_TIMEOUT_SECONDS)
             while asyncio.get_running_loop().time() < deadline:
-                broker_response = await angel_client.order(order_id)
+                remaining = deadline - asyncio.get_running_loop().time()
+                try:
+                    broker_response = await asyncio.wait_for(angel_client.order(order_id), remaining)
+                except asyncio.TimeoutError:
+                    break
                 info = order_data(broker_response)
                 status = str(info.get("orderstatus") or info.get("status") or "PENDING").upper()
                 result.update({"status": status, "order": info})
                 if status in TERMINAL:
                     break
-                await asyncio.sleep(1)
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining > 0:
+                    await asyncio.sleep(min(1, remaining))
             timing.update({"fill_confirmation_completed_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                            "fill_confirmation_duration_ms": round((time.perf_counter() - confirmation_started) * 1000, 1),
                            "fill_confirmed": result["status"] in {"COMPLETE", "TRADED", "FILLED"}})
@@ -144,10 +169,10 @@ async def place_order(request: PlaceOrderRequest):
                                 "response": broker_response, "attempts": [], "retry_count": 0,
                                 "max_retries": 3, "duplicate_prevented": True}
                     state["commands"][request.command_id] = existing
-                    state_store.save(state)
+                    await persist_state(existing)
                     logger.warning("Duplicate copy entry prevented command=%s copy_trade=%s existing_order=%s status=%s",
                                    request.command_id, request.copy_trade_id, existing_id, status)
-                    record("DUPLICATE_ENTRY_PREVENTED", request.command_id, existing)
+                    await record("DUPLICATE_ENTRY_PREVENTED", request.command_id, existing)
                     return existing
             result = await place_market_with_retries(request) if request.order_type == "MARKET" else None
             if result is None:
@@ -160,14 +185,14 @@ async def place_order(request: PlaceOrderRequest):
             if request.tag == "copyentry":
                 state["trades"].setdefault(request.copy_trade_id, {})["entry_order_id"] = order_id
             state["commands"][request.command_id] = result
-            state_store.save(state)
-            record("PLACE_ORDER", request.command_id, result, "success" if result.get("ok") else "failed")
+            await persist_state(result)
+            await record("PLACE_ORDER", request.command_id, result, "success" if result.get("ok") else "failed")
             return result
         except Exception as exc:
             result = {"ok": False, "error": str(exc)}
             state["commands"][request.command_id] = result
-            state_store.save(state)
-            record("PLACE_ORDER", request.command_id, result, "failed")
+            await persist_state(result)
+            await record("PLACE_ORDER", request.command_id, result, "failed")
             logger.exception("Place command failed command=%s", request.command_id)
             raise HTTPException(status_code=502, detail=str(exc))
 
@@ -212,8 +237,8 @@ async def cancel_order(order_id: str, request: CommandRequest):
             result = {"ok": False, "order_id": order_id, "status": before_status,
                       "order": before, "response": {}, "already_filled": True}
             state["commands"][request.command_id] = result
-            state_store.save(state)
-            record("CANCEL_ORDER", request.command_id, result, "failed")
+            await persist_state(result)
+            await record("CANCEL_ORDER", request.command_id, result, "failed")
             return result
     except Exception as exc:
         logger.warning("Pre-cancel status unavailable order_id=%s error=%s", order_id, exc)
@@ -230,8 +255,8 @@ async def cancel_order(order_id: str, request: CommandRequest):
               "status": status, "order": verify, "response": response,
               "status_response": verify_response}
     state["commands"][request.command_id] = result
-    state_store.save(state)
-    record("CANCEL_ORDER", request.command_id, result, "success" if result["ok"] else "failed")
+    await persist_state(result)
+    await record("CANCEL_ORDER", request.command_id, result, "success" if result["ok"] else "failed")
     return result
 
 
@@ -250,8 +275,8 @@ async def modify_order(order_id: str, request: ModifyOrderRequest):
     result = {"ok": bool((response or {}).get("status")), "order_id": order_id,
               "request": payload, "response": response}
     state["commands"][request.command_id] = result
-    state_store.save(state)
-    record("MODIFY_ORDER", request.command_id, result, "success" if result["ok"] else "failed")
+    await persist_state(result)
+    await record("MODIFY_ORDER", request.command_id, result, "success" if result["ok"] else "failed")
     return result
 
 
@@ -293,8 +318,8 @@ async def set_protection(copy_trade_id: str, request: ProtectionRequest):
     result = {"ok": True, "copy_trade_id": copy_trade_id, "orders": placed,
               "sl_price": request.sl_price, "target_price": request.target_price}
     state["commands"][request.command_id] = result
-    state_store.save(state)
-    record("SYNC_PROTECTION", request.command_id, result)
+    await persist_state(result)
+    await record("SYNC_PROTECTION", request.command_id, result)
     return result
 
 
@@ -313,7 +338,7 @@ async def exit_trade(copy_trade_id: str, request: ExitTradeRequest):
             result = {"ok": True, "already_closed": True, "order_id": order_id, "order": info,
                       "closed_by": "sl" if key.startswith("sl") else "target"}
             state["commands"][request.command_id] = result
-            state_store.save(state)
+            await persist_state(result)
             return result
         known = state["orders"].get(order_id) or {}
         await angel_client.call("cancelOrder", order_id, known.get("variety") or "NORMAL")
@@ -323,7 +348,7 @@ async def exit_trade(copy_trade_id: str, request: ExitTradeRequest):
             result = {"ok": True, "already_closed": True, "order_id": order_id, "order": verify,
                       "closed_by": "sl" if key.startswith("sl") else "target"}
             state["commands"][request.command_id] = result
-            state_store.save(state)
+            await persist_state(result)
             return result
     place_request = PlaceOrderRequest(command_id=request.command_id + "-market", copy_trade_id=copy_trade_id,
         contract=request.contract, transaction_type=request.transaction_type, quantity=request.quantity,
@@ -332,8 +357,8 @@ async def exit_trade(copy_trade_id: str, request: ExitTradeRequest):
     order_id = result.get("order_id", "")
     trade.update({"exit_order_id": order_id, "sl_order_id": "", "target_order_id": ""})
     state["commands"][request.command_id] = result
-    state_store.save(state)
-    record("EXIT_TRADE", request.command_id, result, "success" if result.get("ok") else "failed")
+    await persist_state(result)
+    await record("EXIT_TRADE", request.command_id, result, "success" if result.get("ok") else "failed")
     return result
 
 
@@ -355,7 +380,7 @@ async def refresh_protection_trade(copy_trade_id):
             trade.update({"closed_by": "sl" if key.startswith("sl") else "target",
                           "exit_order_id": order_id, "exit_order": info,
                           "sl_order_id": "", "target_order_id": ""})
-            state_store.save(state)
+            await persist_state()
             break
     return trade
 
