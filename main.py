@@ -208,6 +208,12 @@ async def get_order(order_id: str):
                 "status": "PENDING", "status_error": str(exc)}
 
 
+@app.get('/v1/commands/{command_id}', dependencies=[Depends(authorize)])
+async def command_status(command_id: str):
+    result = state['commands'].get(command_id)
+    return {'ok': True, 'found': result is not None, 'result': result or {}}
+
+
 @app.get("/v1/orders", dependencies=[Depends(authorize)])
 async def get_orders():
     response = await angel_client.call("orderBook") or {}
